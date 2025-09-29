@@ -118,17 +118,4 @@ For each future step:
 
 - **MAE** (mean absolute error)  
 - **RMSE** (root mean squared error)  
-- Best model chosen by lowest **MAE**.  
-
----
-
-## Quick Start
-
-### Train
-```bash
-python train_forecast.py \
-  --input-csv data/history.csv \
-  --output-dir artifacts/run1 \
-  --horizon 24 \
-  --max-lag 96
-# (Optional) add --freq H for hourly data
+- Best model chosen by lowest **MAE**.
