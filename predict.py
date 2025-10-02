@@ -28,6 +28,7 @@ class EnhancedTimeSeriesPredictor:
         self.target_col = 'premium'
         self.timestamp_col = 'valueDateTimeOffset'
         self.ensemble_model = None
+        self.residuals = None  # For prediction intervals
 
     def load_model(self, model_path):
         """Load the trained model bundle"""
@@ -45,6 +46,7 @@ class EnhancedTimeSeriesPredictor:
         self.target_col = self.model_bundle.get('target_col', 'premium')
         self.timestamp_col = self.model_bundle.get('timestamp_col', 'valueDateTimeOffset')
         self.ensemble_model = self.model_bundle.get('ensemble_model')
+        self.residuals = self.model_bundle.get('residuals')
 
         print(f"Loaded model: {self.best_model_name}")
         print(f"Feature columns: {len(self.feature_columns)}")
@@ -112,10 +114,11 @@ class EnhancedTimeSeriesPredictor:
             if col in df.columns:
                 for window in windows:
                     if window <= len(df):
-                        rolling_features[f'{col}_rolling_mean_{window}'] = df[col].rolling(window=window, min_periods=1).mean()
-                        rolling_features[f'{col}_rolling_std_{window}'] = df[col].rolling(window=window, min_periods=1).std()
-                        rolling_features[f'{col}_rolling_min_{window}'] = df[col].rolling(window=window, min_periods=1).min()
-                        rolling_features[f'{col}_rolling_max_{window}'] = df[col].rolling(window=window, min_periods=1).max()
+                        # Fix data leakage: use min_periods=window to ensure full window
+                        rolling_features[f'{col}_rolling_mean_{window}'] = df[col].rolling(window=window, min_periods=window).mean()
+                        rolling_features[f'{col}_rolling_std_{window}'] = df[col].rolling(window=window, min_periods=window).std()
+                        rolling_features[f'{col}_rolling_min_{window}'] = df[col].rolling(window=window, min_periods=window).min()
+                        rolling_features[f'{col}_rolling_max_{window}'] = df[col].rolling(window=window, min_periods=window).max()
 
         return rolling_features
 
@@ -128,7 +131,7 @@ class EnhancedTimeSeriesPredictor:
             try:
                 # Use a reasonable period for decomposition
                 period = min(24, len(df) // 4)  # Daily cycle or quarter of data
-                decomposition = seasonal_decompose(df[self.target_col].fillna(method='ffill'),
+                decomposition = seasonal_decompose(df[self.target_col].ffill(),
                                                  model='additive', period=period, extrapolate_trend='freq')
 
                 seasonal_features[f'{self.target_col}_trend'] = decomposition.trend
@@ -347,12 +350,41 @@ class EnhancedTimeSeriesPredictor:
 
         return future_timestamps, predictions
 
-    def save_predictions(self, timestamps, predictions, output_path):
-        """Save predictions to CSV"""
+    def calculate_prediction_intervals(self, predictions, confidence_level=0.95):
+        """Calculate prediction intervals using residual distribution"""
+        if self.residuals is None:
+            print("Warning: No residuals available for prediction intervals")
+            return None, None
+
+        # Calculate quantiles from residuals
+        alpha = 1 - confidence_level
+        lower_quantile = alpha / 2
+        upper_quantile = 1 - (alpha / 2)
+
+        # Use residual quantiles to estimate intervals
+        lower_bound = np.percentile(self.residuals, lower_quantile * 100)
+        upper_bound = np.percentile(self.residuals, upper_quantile * 100)
+
+        # Add to predictions
+        y_lower = predictions + lower_bound
+        y_upper = predictions + upper_bound
+
+        return y_lower, y_upper
+
+    def save_predictions(self, timestamps, predictions, output_path, confidence_level=0.95):
+        """Save predictions to CSV with optional prediction intervals"""
         results_df = pd.DataFrame({
             'valueDateTimeOffset': timestamps,
             'y_pred': predictions
         })
+
+        # Add prediction intervals if available
+        if self.residuals is not None:
+            y_lower, y_upper = self.calculate_prediction_intervals(predictions, confidence_level)
+            if y_lower is not None:
+                results_df['y_lower'] = y_lower
+                results_df['y_upper'] = y_upper
+                results_df['confidence_level'] = confidence_level
 
         results_df.to_csv(output_path, index=False)
         print(f"Predictions saved to {output_path}")

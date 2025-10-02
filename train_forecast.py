@@ -36,11 +36,12 @@ warnings.filterwarnings('ignore')
 plt.style.use('seaborn-v0_8')
 
 class EnhancedTimeSeriesForecaster:
-    def __init__(self, max_lag=96, freq=None, n_trials=100, cv_folds=3):
+    def __init__(self, max_lag=96, freq=None, n_trials=100, cv_folds=3, use_walk_forward=False):
         self.max_lag = max_lag
         self.freq = freq
         self.n_trials = n_trials
         self.cv_folds = cv_folds
+        self.use_walk_forward = use_walk_forward
         self.lag_set = [1, 2, 3, 6, 12, 24, 48, 96]
         self.lag_set = [lag for lag in self.lag_set if lag <= max_lag]
         self.feature_columns = []
@@ -51,6 +52,7 @@ class EnhancedTimeSeriesForecaster:
         self.imputers = {}
         self.best_model_name = None
         self.ensemble_model = None
+        self.residuals = None  # For prediction intervals
 
     def load_data(self, csv_path):
         """Load and initial processing of data"""
@@ -126,10 +128,11 @@ class EnhancedTimeSeriesForecaster:
         for col in [self.target_col] + self.feature_columns:
             for window in windows:
                 if window <= len(df):
-                    rolling_features[f'{col}_rolling_mean_{window}'] = df[col].rolling(window=window, min_periods=1).mean()
-                    rolling_features[f'{col}_rolling_std_{window}'] = df[col].rolling(window=window, min_periods=1).std()
-                    rolling_features[f'{col}_rolling_min_{window}'] = df[col].rolling(window=window, min_periods=1).min()
-                    rolling_features[f'{col}_rolling_max_{window}'] = df[col].rolling(window=window, min_periods=1).max()
+                    # Fix data leakage: use min_periods=window to ensure full window
+                    rolling_features[f'{col}_rolling_mean_{window}'] = df[col].rolling(window=window, min_periods=window).mean()
+                    rolling_features[f'{col}_rolling_std_{window}'] = df[col].rolling(window=window, min_periods=window).std()
+                    rolling_features[f'{col}_rolling_min_{window}'] = df[col].rolling(window=window, min_periods=window).min()
+                    rolling_features[f'{col}_rolling_max_{window}'] = df[col].rolling(window=window, min_periods=window).max()
 
         return rolling_features
 
@@ -142,7 +145,7 @@ class EnhancedTimeSeriesForecaster:
             try:
                 # Use a reasonable period for decomposition
                 period = min(24, len(df) // 4)  # Daily cycle or quarter of data
-                decomposition = seasonal_decompose(df[self.target_col].fillna(method='ffill'),
+                decomposition = seasonal_decompose(df[self.target_col].ffill(),
                                                  model='additive', period=period, extrapolate_trend='freq')
 
                 seasonal_features[f'{self.target_col}_trend'] = decomposition.trend
@@ -294,28 +297,31 @@ class EnhancedTimeSeriesForecaster:
                     'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
                     'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
                     'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0),
+                    'n_estimators': 1000,  # Use early stopping
                 }
                 model = lgb.LGBMRegressor(**params, random_state=42, verbose=-1)
 
             elif model_type == 'xgboost':
                 params = {
-                    'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+                    'n_estimators': 1000,  # Use early stopping
                     'max_depth': trial.suggest_int('max_depth', 3, 10),
                     'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
                     'subsample': trial.suggest_float('subsample', 0.6, 1.0),
                     'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
                     'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
                     'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0),
+                    'early_stopping_rounds': 50,
                 }
                 model = xgb.XGBRegressor(**params, random_state=42, verbose=0)
 
             elif model_type == 'catboost':
                 params = {
-                    'iterations': trial.suggest_int('iterations', 50, 500),
+                    'iterations': 1000,  # Use early stopping
                     'depth': trial.suggest_int('depth', 3, 10),
                     'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
                     'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 0.1, 10.0),
                     'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                    'early_stopping_rounds': 50,
                 }
                 model = cb.CatBoostRegressor(**params, random_state=42, verbose=False)
 
@@ -340,7 +346,23 @@ class EnhancedTimeSeriesForecaster:
                     X_tr_processed = temp_imputer.fit_transform(X_tr)
                     X_val_processed = temp_imputer.transform(X_val)
 
-                model.fit(X_tr_processed, y_tr)
+                # Fit with early stopping for gradient boosting models
+                if model_type in ['lightgbm', 'xgboost', 'catboost']:
+                    if model_type == 'lightgbm':
+                        model.fit(X_tr_processed, y_tr,
+                                eval_set=[(X_val_processed, y_val)],
+                                callbacks=[lgb.early_stopping(50, verbose=False)])
+                    elif model_type == 'xgboost':
+                        model.fit(X_tr_processed, y_tr,
+                                eval_set=[(X_val_processed, y_val)],
+                                verbose=False)
+                    elif model_type == 'catboost':
+                        model.fit(X_tr_processed, y_tr,
+                                eval_set=(X_val_processed, y_val),
+                                verbose=False)
+                else:
+                    model.fit(X_tr_processed, y_tr)
+
                 y_pred = model.predict(X_val_processed)
                 mae = mean_absolute_error(y_val, y_pred)
                 scores.append(mae)
@@ -402,8 +424,28 @@ class EnhancedTimeSeriesForecaster:
                 else:  # catboost
                     model = cb.CatBoostRegressor(**best_params, random_state=42, verbose=False)
 
-            # Train the model
-            model.fit(X_processed, y_train)
+            # Train the model (with early stopping for tree models)
+            if model_name in ['lightgbm', 'xgboost', 'catboost']:
+                # Create a validation split for early stopping
+                val_size = int(len(X_train) * 0.2)
+                X_tr, X_val = X_processed[:-val_size], X_processed[-val_size:]
+                y_tr, y_val = y_train.iloc[:-val_size], y_train.iloc[-val_size:]
+
+                if model_name == 'lightgbm':
+                    model.fit(X_tr, y_tr,
+                            eval_set=[(X_val, y_val)],
+                            callbacks=[lgb.early_stopping(50, verbose=False)])
+                elif model_name == 'xgboost':
+                    model.fit(X_tr, y_tr,
+                            eval_set=[(X_val, y_val)],
+                            verbose=False)
+                elif model_name == 'catboost':
+                    model.fit(X_tr, y_tr,
+                            eval_set=(X_val, y_val),
+                            verbose=False)
+            else:
+                model.fit(X_processed, y_train)
+
             self.models[model_name] = model
             print(f"{model_name} training completed")
 
@@ -420,6 +462,75 @@ class EnhancedTimeSeriesForecaster:
         # Instead, we'll create a custom ensemble that averages predictions
         self.ensemble_model = 'weighted_average'  # Flag for custom ensemble
         print("Ensemble model created using weighted average")
+
+    def walk_forward_validation(self, X, y, n_splits=5):
+        """Perform walk-forward validation"""
+        print(f"\nPerforming walk-forward validation with {n_splits} splits...")
+
+        n = len(X)
+        min_train = int(n * 0.6)  # Minimum 60% for initial training
+        step_size = (n - min_train) // n_splits
+
+        results = {model_name: [] for model_name in self.models.keys()}
+        results['ensemble'] = []
+
+        for i in range(n_splits):
+            train_end = min_train + i * step_size
+            test_start = train_end
+            test_end = min(train_end + step_size, n)
+
+            if test_end <= test_start:
+                break
+
+            print(f"  Split {i+1}/{n_splits}: Train[0:{train_end}], Test[{test_start}:{test_end}]")
+
+            X_train_wf = X.iloc[:train_end]
+            y_train_wf = y.iloc[:train_end]
+            X_test_wf = X.iloc[test_start:test_end]
+            y_test_wf = y.iloc[test_start:test_end]
+
+            # Evaluate each model
+            for model_name, model in self.models.items():
+                if model_name in ['ridge', 'lasso']:
+                    X_processed = self.scalers[model_name].transform(
+                        self.imputers[model_name].transform(X_test_wf)
+                    )
+                else:
+                    X_processed = self.imputers[model_name].transform(X_test_wf)
+
+                y_pred = model.predict(X_processed)
+                mae = mean_absolute_error(y_test_wf, y_pred)
+                results[model_name].append(mae)
+
+            # Ensemble
+            ensemble_pred = np.zeros(len(y_test_wf))
+            for model_name in self.models.keys():
+                if model_name in ['ridge', 'lasso']:
+                    X_processed = self.scalers[model_name].transform(
+                        self.imputers[model_name].transform(X_test_wf)
+                    )
+                else:
+                    X_processed = self.imputers[model_name].transform(X_test_wf)
+                ensemble_pred += self.models[model_name].predict(X_processed)
+            ensemble_pred /= len(self.models)
+
+            mae_ensemble = mean_absolute_error(y_test_wf, ensemble_pred)
+            results['ensemble'].append(mae_ensemble)
+
+        # Average results
+        avg_results = {}
+        for model_name, scores in results.items():
+            avg_mae = np.mean(scores)
+            std_mae = np.std(scores)
+            avg_results[model_name] = {'mae': avg_mae, 'mae_std': std_mae}
+            print(f"  {model_name:10s} | MAE: {avg_mae:.4f} ± {std_mae:.4f}")
+
+        # Select best model
+        best_model = min(avg_results.keys(), key=lambda x: avg_results[x]['mae'])
+        self.best_model_name = best_model
+        print(f"\nBest model (walk-forward): {best_model} (MAE: {avg_results[best_model]['mae']:.4f})")
+
+        return avg_results
 
     def evaluate_models(self, X_test, y_test):
         """Evaluate all models and select the best one"""
@@ -445,7 +556,8 @@ class EnhancedTimeSeriesForecaster:
             results[model_name] = {
                 'mae': mae,
                 'rmse': rmse,
-                'predictions': y_pred
+                'predictions': y_pred,
+                'residuals': y_test.values - y_pred
             }
 
             print(f"{model_name:10s} | MAE: {mae:.4f} | RMSE: {rmse:.4f}")
@@ -462,7 +574,8 @@ class EnhancedTimeSeriesForecaster:
         results['ensemble'] = {
             'mae': ensemble_mae,
             'rmse': ensemble_rmse,
-            'predictions': ensemble_pred
+            'predictions': ensemble_pred,
+            'residuals': y_test.values - ensemble_pred
         }
 
         print(f"{'ensemble':10s} | MAE: {ensemble_mae:.4f} | RMSE: {ensemble_rmse:.4f}")
@@ -471,16 +584,47 @@ class EnhancedTimeSeriesForecaster:
         best_model = min(results.keys(), key=lambda x: results[x]['mae'])
         self.best_model_name = best_model
 
+        # Store residuals for prediction intervals
+        self.residuals = results[best_model]['residuals']
+
         print(f"\nBest model: {best_model} (MAE: {results[best_model]['mae']:.4f})")
 
         return results
 
-    def create_prediction_chart(self, timestamps, y_true, y_pred, save_path='forecast_chart.png'):
-        """Create and save prediction vs actual chart"""
+    def calculate_prediction_intervals(self, y_pred, confidence_level=0.95):
+        """Calculate prediction intervals using residual distribution"""
+        if self.residuals is None:
+            print("Warning: No residuals available for prediction intervals")
+            return y_pred, y_pred
+
+        # Calculate quantiles from residuals
+        alpha = 1 - confidence_level
+        lower_quantile = alpha / 2
+        upper_quantile = 1 - (alpha / 2)
+
+        # Use residual quantiles to estimate intervals
+        lower_bound = np.percentile(self.residuals, lower_quantile * 100)
+        upper_bound = np.percentile(self.residuals, upper_quantile * 100)
+
+        # Add to predictions
+        y_lower = y_pred + lower_bound
+        y_upper = y_pred + upper_bound
+
+        return y_lower, y_upper
+
+    def create_prediction_chart(self, timestamps, y_true, y_pred, save_path='forecast_chart.png',
+                               show_intervals=True, confidence_level=0.95):
+        """Create and save prediction vs actual chart with optional prediction intervals"""
         plt.figure(figsize=(15, 8))
 
         plt.plot(timestamps, y_true, label='Actual', alpha=0.7, linewidth=1)
         plt.plot(timestamps, y_pred, label='Predicted', alpha=0.8, linewidth=1)
+
+        # Add prediction intervals if available
+        if show_intervals and self.residuals is not None:
+            y_lower, y_upper = self.calculate_prediction_intervals(y_pred, confidence_level)
+            plt.fill_between(timestamps, y_lower, y_upper, alpha=0.2,
+                           label=f'{int(confidence_level*100)}% Prediction Interval')
 
         plt.title('Actual vs Predicted Values', fontsize=16, pad=20)
         plt.xlabel('Time', fontsize=12)
@@ -497,6 +641,52 @@ class EnhancedTimeSeriesForecaster:
         plt.close()
 
         print(f"Prediction chart saved to {save_path}")
+
+    def get_feature_importance(self):
+        """Get feature importance from the best model"""
+        feature_importance = {}
+
+        if self.best_model_name == 'ensemble':
+            # Average importance across all tree models
+            for model_name, model in self.models.items():
+                if model_name in ['lightgbm', 'xgboost', 'catboost']:
+                    if hasattr(model, 'feature_importances_'):
+                        feature_importance[model_name] = model.feature_importances_
+        else:
+            # Get importance from best model
+            model = self.models[self.best_model_name]
+            if hasattr(model, 'feature_importances_'):
+                feature_importance[self.best_model_name] = model.feature_importances_
+            elif hasattr(model, 'coef_'):  # Linear models
+                feature_importance[self.best_model_name] = np.abs(model.coef_)
+
+        return feature_importance
+
+    def save_feature_importance(self, feature_names, output_path='feature_importance.csv'):
+        """Save feature importance to CSV"""
+        importance_dict = self.get_feature_importance()
+
+        if not importance_dict:
+            print("No feature importance available for this model")
+            return
+
+        # Create DataFrame with feature importances
+        importance_df = pd.DataFrame({'feature': feature_names})
+
+        for model_name, importances in importance_dict.items():
+            importance_df[f'{model_name}_importance'] = importances
+
+        # Sort by importance (use first model's importance)
+        first_col = importance_df.columns[1]
+        importance_df = importance_df.sort_values(first_col, ascending=False)
+
+        importance_df.to_csv(output_path, index=False)
+        print(f"Feature importance saved to {output_path}")
+
+        # Print top 10 features
+        print("\nTop 10 most important features:")
+        for _, row in importance_df.head(10).iterrows():
+            print(f"  {row['feature']}: {row[first_col]:.6f}")
 
     def refit_best_model(self, X_full, y_full):
         """Refit the best model on full dataset"""
@@ -526,7 +716,7 @@ class EnhancedTimeSeriesForecaster:
 
         print("Model refitting completed")
 
-    def save_model(self, filepath='model.pkl'):
+    def save_model(self, filepath='model.pkl', feature_names=None):
         """Save the complete model bundle"""
         model_bundle = {
             'best_model_name': self.best_model_name,
@@ -534,12 +724,14 @@ class EnhancedTimeSeriesForecaster:
             'scalers': self.scalers,
             'imputers': self.imputers,
             'feature_columns': self.feature_columns,
+            'feature_names': feature_names,  # Save exact feature order from training
             'lag_set': self.lag_set,
             'max_lag': self.max_lag,
             'freq': self.freq,
             'target_col': self.target_col,
             'timestamp_col': self.timestamp_col,
-            'ensemble_model': self.ensemble_model
+            'ensemble_model': self.ensemble_model,
+            'residuals': self.residuals  # For prediction intervals
         }
 
         joblib.dump(model_bundle, filepath)
@@ -557,6 +749,8 @@ def main():
     parser.add_argument('--forecast-path', type=str, default='forecast.csv', help='Path to save forecasts')
     parser.add_argument('--metrics-path', type=str, default='metrics.json', help='Path to save metrics')
     parser.add_argument('--chart-path', type=str, default='forecast_chart.png', help='Path to save chart')
+    parser.add_argument('--importance-path', type=str, default='feature_importance.csv', help='Path to save feature importance')
+    parser.add_argument('--walk-forward', action='store_true', help='Use walk-forward validation instead of single train/test split')
 
     args = parser.parse_args()
 
@@ -565,7 +759,8 @@ def main():
         max_lag=args.max_lag,
         freq=args.freq,
         n_trials=args.n_trials,
-        cv_folds=args.cv_folds
+        cv_folds=args.cv_folds,
+        use_walk_forward=args.walk_forward
     )
 
     # Load and process data
@@ -584,13 +779,19 @@ def main():
     y = feature_df[forecaster.target_col]
     timestamps = feature_df[forecaster.timestamp_col]
 
-    # Time-based split (80/20)
+    # Time-based split (80/20) with proper temporal separation
+    # Add max_lag buffer to prevent data leakage from training into test
     split_idx = int(len(X) * 0.8)
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-    timestamps_test = timestamps.iloc[split_idx:]
+    X_train = X.iloc[:split_idx]
+    y_train = y.iloc[:split_idx]
 
-    print(f"Train size: {len(X_train)}, Test size: {len(X_test)}")
+    # Start test set after max_lag to prevent leakage from lag features
+    test_start_idx = min(split_idx + forecaster.max_lag, len(X))
+    X_test = X.iloc[test_start_idx:]
+    y_test = y.iloc[test_start_idx:]
+    timestamps_test = timestamps.iloc[test_start_idx:]
+
+    print(f"Train size: {len(X_train)}, Test size: {len(X_test)} (with {forecaster.max_lag}-step buffer)")
 
     # Train models
     forecaster.train_models(X_train, y_train)
@@ -598,18 +799,27 @@ def main():
     # Create ensemble
     forecaster.create_ensemble(X_train, y_train)
 
-    # Evaluate models
-    results = forecaster.evaluate_models(X_test, y_test)
+    # Evaluate models - use walk-forward if enabled
+    if forecaster.use_walk_forward:
+        print("\nUsing walk-forward validation...")
+        wf_results = forecaster.walk_forward_validation(X, y, n_splits=5)
+        # Still evaluate on test set for comparison
+        results = forecaster.evaluate_models(X_test, y_test)
+    else:
+        results = forecaster.evaluate_models(X_test, y_test)
 
     # Create prediction chart
     best_predictions = results[forecaster.best_model_name]['predictions']
     forecaster.create_prediction_chart(timestamps_test, y_test, best_predictions, args.chart_path)
 
+    # Save feature importance before refitting
+    forecaster.save_feature_importance(feature_cols, args.importance_path)
+
     # Refit best model on full data
     forecaster.refit_best_model(X, y)
 
-    # Save results
-    forecaster.save_model(args.model_path)
+    # Save results with feature names for proper prediction
+    forecaster.save_model(args.model_path, feature_names=feature_cols)
 
     # Save forecast results
     forecast_df = pd.DataFrame({
