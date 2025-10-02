@@ -45,6 +45,7 @@ class EnhancedTimeSeriesForecaster:
         self.lag_set = [1, 2, 3, 6, 12, 24, 48, 96]
         self.lag_set = [lag for lag in self.lag_set if lag <= max_lag]
         self.feature_columns = []
+        self.feature_names = []  # Store actual feature names used during training
         self.target_col = 'premium'
         self.timestamp_col = 'valueDateTimeOffset'
         self.models = {}
@@ -379,6 +380,9 @@ class EnhancedTimeSeriesForecaster:
         """Train all models with hyperparameter optimization"""
         print("Training models with hyperparameter optimization...")
 
+        # Store feature names from training data
+        self.feature_names = list(X_train.columns)
+
         model_configs = {
             'ridge': Ridge,
             'lasso': Lasso,
@@ -662,13 +666,24 @@ class EnhancedTimeSeriesForecaster:
 
         return feature_importance
 
-    def save_feature_importance(self, feature_names, output_path='feature_importance.csv'):
+    def save_feature_importance(self, feature_names=None, output_path='feature_importance.csv'):
         """Save feature importance to CSV"""
         importance_dict = self.get_feature_importance()
 
         if not importance_dict:
             print("No feature importance available for this model")
             return
+
+        # Use stored feature names if not provided
+        if feature_names is None:
+            feature_names = self.feature_names
+
+        # Verify length matches
+        first_importance = next(iter(importance_dict.values()))
+        if len(feature_names) != len(first_importance):
+            print(f"Warning: Feature name count ({len(feature_names)}) doesn't match importance count ({len(first_importance)})")
+            print("Using stored feature names from training data")
+            feature_names = self.feature_names
 
         # Create DataFrame with feature importances
         importance_df = pd.DataFrame({'feature': feature_names})
