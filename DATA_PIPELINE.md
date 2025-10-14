@@ -174,17 +174,140 @@ python data.py --start 2025-01-01 --end 2025-01-31 --sources 1 2 --output data/c
 
 ---
 
-### Source 3: [Placeholder]
+### Source 3: Elexon BMRS Imbalance Settlement System Prices
 
-**Status:** 🔲 Not Yet Implemented
+**Status:** ✅ Implemented
 
-**Description:** Coming soon...
+**Description:** Fetches imbalance settlement system prices from the Elexon BMRS API. This provides the system sell price (imbalance price) which represents the price at which the system is short and needs to buy energy to balance.
 
-**Usage:**
-```bash
-# When implemented, use multiple sources:
-python data.py --start 2025-01-01 --end 2025-01-31 --sources 1 2 3 --output data/combined.csv
+**API Endpoint:**
 ```
+https://data.elexon.co.uk/bmrs/api/v1/balancing/settlement/system-prices/{date}?format=json
+```
+
+**How it Works:**
+1. For each date `D` in the range `[start_date, end_date]`:
+   - Requests data for settlement date = `D`
+   - Fetches data once per day
+   - Extracts `systemSellPrice` and renames it to `imbalancePrice`
+
+2. Data granularity: **30-minute intervals** (48 settlement periods per day)
+
+3. Output columns:
+   - `valueDateTimeOffset` - UTC timestamp
+   - `settlementPeriod` - Settlement period number (1-48)
+   - `imbalancePrice` - System sell price (£/MWh), representing imbalance settlement price
+
+**Features:**
+- ✅ HTTP retry logic (3 attempts with exponential backoff)
+- ✅ Automatic duplicate removal
+- ✅ Sorts by timestamp
+- ✅ Robust error handling for missing data
+- ✅ No API key required
+
+**Join Keys:**
+- Merges with Source 1 and Source 2 on: `['valueDateTimeOffset', 'settlementPeriod']`
+
+**Example:**
+```bash
+# Fetch Source 1, 2, and 3
+python data.py --start 2025-01-01 --end 2025-01-31 --sources 1 2 3 --output data/with_imbalance.csv
+```
+
+**Expected Output Size:**
+- 1 day = 48 rows (30-min intervals)
+- 1 week = ~336 rows
+- 1 month = ~1,440 rows
+- 1 year = ~17,520 rows
+
+**API Call Volume:**
+- 1 day = 1 API call
+- 1 week = 7 API calls
+- 1 month = 31 API calls
+- 1 year = 365 API calls
+
+**Performance Notes:**
+⚠️ This source makes the **same number of API calls** as Source 1. For a 1-month date range:
+- Source 1 alone: ~31 API calls, ~30 seconds
+- Source 3 alone: ~31 API calls, ~30 seconds
+- Source 1 + 3: ~62 API calls, ~60 seconds
+- All sources (1 + 2 + 3): ~589 API calls, ~5-10 minutes (Source 2 dominates)
+
+**Use Case:**
+This source provides one component needed to calculate the **premium** target variable:
+- `imbalancePrice` (from this source, Source 3)
+- `spotPrice` (from IDA1 HH spot price, to be implemented)
+- `premium = imbalancePrice - spotPrice` (calculated after both sources are loaded)
+
+---
+
+### Source 4: Elexon BMRS Loss of Load Probability & Derated Margin (LOLPDRM)
+
+**Status:** ✅ Implemented
+
+**Description:** Fetches Loss of Load Probability (LOLP) and Derated Margin data from the Elexon BMRS streaming API. These metrics indicate the risk of power shortages and the available generation margin in the system.
+
+**API Endpoint:**
+```
+https://data.elexon.co.uk/bmrs/api/v1/datasets/LOLPDRM/stream
+```
+
+**How it Works:**
+1. For each date `D` in the range `[start_date, end_date]`:
+   - Requests data published between `D + T16:15:00Z` and `D + T16:45:00Z` (30-minute window)
+   - Filters results to only include settlement date = `D + 1 day` (day-ahead forecast)
+   - Takes the latest `publishTime` for each `settlementPeriod` (most recent forecast within the window)
+   - Fetches data once per day
+
+2. Data granularity: **30-minute intervals** (48 settlement periods per day)
+
+3. Output columns:
+   - `valueDateTimeOffset` - UTC timestamp
+   - `settlementPeriod` - Settlement period number (1-48)
+   - `lossOfLoadProbability` - Probability of loss of load (0-1 or percentage)
+   - `deratedMargin` - Derated margin (MW) - available generation capacity after accounting for forced outages
+
+**Features:**
+- ✅ HTTP retry logic (3 attempts with exponential backoff)
+- ✅ Automatic duplicate removal (takes latest publishTime per settlementPeriod)
+- ✅ Sorts by timestamp
+- ✅ Robust error handling for missing data
+- ✅ No API key required
+
+**Join Keys:**
+- Merges with other sources on: `['valueDateTimeOffset', 'settlementPeriod']`
+
+**Example:**
+```bash
+# Fetch Source 1 and Source 4
+python data.py --start 2025-01-01 --end 2025-01-31 --sources 1 4 --output data/with_lolpdrm.csv
+
+# Fetch all sources (1, 2, 3, 4)
+python data.py --start 2025-01-01 --end 2025-01-31 --sources 1 2 3 4 --output data/full_dataset.csv
+```
+
+**Expected Output Size:**
+- 1 day = 48 rows (30-min intervals)
+- 1 week = ~336 rows
+- 1 month = ~1,440 rows
+- 1 year = ~17,520 rows
+
+**API Call Volume:**
+- 1 day = 1 API call
+- 1 week = 7 API calls
+- 1 month = 31 API calls
+- 1 year = 365 API calls
+
+**Performance Notes:**
+⚠️ This source makes the **same number of API calls** as Source 1 and Source 3. For a 1-month date range:
+- Source 4 alone: ~31 API calls, ~30 seconds
+- Source 1 + 4: ~62 API calls, ~60 seconds
+- All sources (1 + 2 + 3 + 4): ~620 API calls, ~5-10 minutes (Source 2 dominates)
+
+**Use Case:**
+These metrics provide insights into system reliability and capacity margins, which can be valuable features for forecasting:
+- `lossOfLoadProbability` - Indicates system stress and potential shortage risk
+- `deratedMargin` - Shows available generation capacity after forced outages
 
 ---
 
@@ -217,16 +340,18 @@ python data.py --start 2025-01-01 --end 2025-01-31 --output data/january_data.cs
 ### Example 3: Fetch Multiple Data Sources
 
 ```bash
-# Fetch both Source 1 and Source 2 for a month
-python data.py --start 2025-01-01 --end 2025-01-31 --sources 1 2 --output data/combined_dataset.csv
+# Fetch Source 1, 2, 3, and 4 for a month
+python data.py --start 2025-01-01 --end 2025-01-31 --sources 1 2 3 4 --output data/combined_dataset.csv
 ```
 
 **Output:**
 - ~1,488 rows (31 days × 48 rows/day)
-- 72 columns total:
+- 75 columns total:
   - 2 join keys: `valueDateTimeOffset`, `settlementPeriod`
   - 2 from Source 1: `transmissionSystemDemand`, `nationalDemand`
   - 68 from Source 2: All boundary metrics (B1-B17 × 4 metrics)
+  - 1 from Source 3: `imbalancePrice`
+  - 2 from Source 4: `lossOfLoadProbability`, `deratedMargin`
 
 This will merge all specified sources on `valueDateTimeOffset` and `settlementPeriod`.
 
@@ -455,19 +580,22 @@ The script performs the following validation:
 
 ## Version History
 
-### Version 1.1 (Current)
+### Version 1.3 (Current)
 - ✅ Implemented Source 1: Elexon BMRS Day-Ahead Demand
 - ✅ Implemented Source 2: Elexon BMRS Indicated Imbalance by Boundary
+- ✅ Implemented Source 3: Elexon BMRS Imbalance Settlement System Prices
+- ✅ Implemented Source 4: Elexon BMRS Loss of Load Probability & Derated Margin (LOLPDRM)
 - ✅ Global date range parameters (--start, --end)
 - ✅ HTTP retry logic with exponential backoff
 - ✅ Features-only mode (no premium column required)
 - ✅ Robust error handling and logging
 - ✅ Multi-column join support (valueDateTimeOffset + settlementPeriod)
 - ✅ Automatic data reshaping (long to wide format for boundaries)
+- ✅ Time window support for publish date filtering (Source 4)
 
 ### Planned Features
-- 🔲 Source 3: [To be determined]
-- 🔲 Automatic premium/target column generation
+- 🔲 Source 5: IDA1 HH Spot Price (for premium calculation)
+- 🔲 Automatic premium/target column generation (imbalancePrice - spotPrice)
 - 🔲 Data caching for faster re-runs
 - 🔲 Parallel API requests for faster fetching (especially for Source 2)
 
@@ -482,4 +610,4 @@ For issues, questions, or feature requests:
 
 ---
 
-**Last Updated:** 2025-10-13
+**Last Updated:** 2025-10-14
